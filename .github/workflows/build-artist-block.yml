@@ -844,7 +844,7 @@ jobs:
                               count=1,
                           )
                       txt, m_sub = re.subn(
-                          r"(override\s+fun\s+onMediaItemTransition\s*\(\s*(\w+)\s*:\s*MediaItem\?\s*,\s*\w+\s*:\s*Int\s*,?\)\s*\{)",
+                          r"(override\s+fun\s+onMediaItemTransition\s*\(\s*(\w+)\s*:\s*MediaItem\?\s*,\s*\w+\s*:\s*Int\s*,?\s*\)\s*\{)",
                           r"\1\n        ArtistBlockHelper.initContext(this)\n        if (ArtistBlockHelper.onPlayerActivity(player, \2)) return",
                           txt,
                           count=1,
