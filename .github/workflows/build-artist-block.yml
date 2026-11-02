@@ -1,11 +1,11 @@
-name: Build Metrolist with Artist Block
+name: Build Metrolist with In-App Artist Block
 
 on:
   workflow_dispatch:
     inputs:
       blocked_artists:
-        description: "Default blocked artists (comma-separated, e.g. Beyonce, Drake)"
-        required: true
+        description: "Initial blocked artists (comma-separated, can be edited anytime inside the app)"
+        required: false
         default: "Beyonce"
         type: string
 
@@ -43,7 +43,7 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Fix Duplicate Resources, Patch Source & Compile APK
+      - name: Inject In-App Artist Blocker UI, Settings & Playback Filters (with Fail-Fast Checks)
         env:
           BLOCKED_ARTISTS: ${{ inputs.blocked_artists }}
         run: |
@@ -51,20 +51,28 @@ jobs:
           python3 - << 'EOF'
           import os, re, xml.etree.ElementTree as ET
 
-          # 1. Fix "Error: Duplicate resources" in app/src/main/res/values*
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          ET.register_namespace("xliff", "urn:oasis:names:tc:xliff:document:1.2")
+
+          # =========================================================================
+          # 1. Deduplicate XML resources in app/src/main/res/values* (if any exist)
+          # =========================================================================
           res_dir = "app/src/main/res"
           if os.path.isdir(res_dir):
               for folder in os.listdir(res_dir):
                   folder_path = os.path.join(res_dir, folder)
                   if os.path.isdir(folder_path) and folder.startswith("values"):
                       seen_items = set()
-                      # Process strings.xml first, then metrolist_strings.xml and others
-                      xml_files = sorted([f for f in os.listdir(folder_path) if f.endswith(".xml")],
-                                         key=lambda x: (0 if x == "strings.xml" else 1, x))
+                      xml_files = sorted(
+                          [f for f in os.listdir(folder_path) if f.endswith(".xml")],
+                          key=lambda x: (0 if x == "strings.xml" else 1, x),
+                      )
                       for fn in xml_files:
                           fp = os.path.join(folder_path, fn)
                           try:
-                              tree = ET.parse(fp)
+                              parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+                              tree = ET.parse(fp, parser=parser)
                               root = tree.getroot()
                               removed = False
                               for child in list(root):
@@ -82,8 +90,204 @@ jobs:
                           except Exception as e:
                               print(f"[!] Warning parsing {fp}: {e}")
 
-          # 2. Inject ArtistBlockHelper.kt
-          blocked_default = os.environ.get("BLOCKED_ARTISTS", "Beyonce").replace('"', '\\"')
+          # =========================================================================
+          # 2. Inject ArtistBlockCore.kt into :innertube (shared by :innertube & :app)
+          # =========================================================================
+          blocked_default = os.environ.get("BLOCKED_ARTISTS", "Beyonce")
+          blocked_default = (
+              blocked_default.replace("\\", "\\\\")
+              .replace('"', '\\"')
+              .replace("\r", "")
+              .replace("\n", ",")
+              .replace("$", "${'$'}")
+          )
+
+          innertube_models_dir = "innertube/src/main/kotlin/com/metrolist/innertube/models"
+          if not os.path.isdir(innertube_models_dir):
+              innertube_models_dir = "innertube/src/main/java/com/metrolist/innertube/models"
+          os.makedirs(innertube_models_dir, exist_ok=True)
+
+          core_path = os.path.join(innertube_models_dir, "ArtistBlockCore.kt")
+          core_code = '''package com.metrolist.innertube.models
+
+          import java.io.File
+          import java.text.Normalizer
+          import java.util.Locale
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          object ArtistBlockCore {
+              private val diacriticsRegex = Regex("\\\\p{Mn}+")
+              private const val DEFAULT_SEED = "__DEFAULT_BLOCKED__"
+              private const val FILE_NAME = "metrolist_blocked_artists.txt"
+
+              @Volatile
+              private var storageFile: File? = null
+
+              @Volatile
+              private var initialized = false
+
+              @Volatile
+              var displayArtists: List<String> = emptyList()
+                  private set
+
+              @Volatile
+              var normalizedTokens: List<String> = emptyList()
+                  private set
+
+              private val listeners = CopyOnWriteArrayList<() -> Unit>()
+
+              init {
+                  ensureLoaded()
+              }
+
+              fun normalize(text: CharSequence?): String {
+                  if (text == null) return ""
+                  val raw = text.toString().trim()
+                  if (raw.isEmpty()) return ""
+                  val nfd = Normalizer.normalize(raw, Normalizer.Form.NFD)
+                  return diacriticsRegex.replace(nfd, "").lowercase(Locale.ROOT).trim()
+              }
+
+              private fun resolveStorageFile(): File? {
+                  storageFile?.let { return it }
+                  return runCatching {
+                      val atClass = Class.forName("android.app.ActivityThread")
+                      val app = atClass.getMethod("currentApplication").invoke(null)
+                      if (app != null) {
+                          val filesDir = app.javaClass.getMethod("getFilesDir").invoke(app) as? File
+                          if (filesDir != null) {
+                              val f = File(filesDir, FILE_NAME)
+                              storageFile = f
+                              f
+                          } else null
+                      } else null
+                  }.getOrNull()
+              }
+              @Synchronized
+              fun attachStorageDir(filesDir: File) {
+                  val f = File(filesDir, FILE_NAME)
+                  storageFile = f
+                  ensureLoaded()
+              }
+
+              @Synchronized
+              fun ensureLoaded() {
+                  val file = resolveStorageFile()
+                  if (file != null) {
+                      if (file.exists()) {
+                          val content = runCatching { file.readText(Charsets.UTF_8) }.getOrDefault("")
+                          applyRawInternal(content, persist = false)
+                          initialized = true
+                          return
+                      } else if (!initialized) {
+                          applyRawInternal(DEFAULT_SEED, persist = true)
+                          initialized = true
+                          return
+                      }
+                  } else if (!initialized) {
+                      applyRawInternal(DEFAULT_SEED, persist = false)
+                  }
+              }
+
+              private fun applyRawInternal(raw: String, persist: Boolean) {
+                  val seen = LinkedHashMap<String, String>()
+                  raw.split(',', ';', '\\n')
+                      .map { it.trim() }
+                      .filter { it.isNotEmpty() }
+                      .forEach { item ->
+                          val norm = normalize(item)
+                          if (norm.isNotEmpty() && !seen.containsKey(norm)) {
+                              seen[norm] = item
+                          }
+                      }
+                  displayArtists = seen.values.toList()
+                  normalizedTokens = seen.keys.toList()
+                  if (persist) {
+                      val file = resolveStorageFile()
+                      if (file != null) {
+                          runCatching {
+                              file.parentFile?.mkdirs()
+                              file.writeText(displayArtists.joinToString("\\n"), Charsets.UTF_8)
+                          }
+                      }
+                  }
+                  listeners.forEach { runCatching { it.invoke() } }
+              }
+
+              @Synchronized
+              fun setRawBlockedArtists(raw: String) {
+                  ensureLoaded()
+                  applyRawInternal(raw, persist = true)
+                  initialized = true
+              }
+
+              @Synchronized
+              fun blockArtist(name: String) {
+                  ensureLoaded()
+                  val clean = name.trim()
+                  val norm = normalize(clean)
+                  if (norm.isEmpty()) return
+                  if (normalizedTokens.contains(norm)) return
+                  val updated = displayArtists + clean
+                  applyRawInternal(updated.joinToString("\\n"), persist = true)
+                  initialized = true
+              }
+
+              @Synchronized
+              fun unblockArtist(name: String) {
+                  ensureLoaded()
+                  val norm = normalize(name)
+                  if (norm.isEmpty()) return
+                  val updated = displayArtists.filterNot { normalize(it) == norm }
+                  applyRawInternal(updated.joinToString("\\n"), persist = true)
+                  initialized = true
+              }
+
+              @Synchronized
+              fun toggleArtist(name: String): Boolean {
+                  ensureLoaded()
+                  return if (isArtistNameBlocked(name)) {
+                      val norm = normalize(name)
+                      val updated = displayArtists.filterNot { token ->
+                          val tn = normalize(token)
+                          tn == norm || norm.contains(tn) || tn.contains(norm)
+                      }
+                      applyRawInternal(updated.joinToString("\\n"), persist = true)
+                      initialized = true
+                      false
+                  } else {
+                      blockArtist(name)
+                      true
+                  }
+              }
+
+              fun isArtistNameBlocked(name: CharSequence?): Boolean {
+                  if (!initialized) ensureLoaded()
+                  val tokens = normalizedTokens
+                  if (tokens.isEmpty() || name.isNullOrBlank()) return false
+                  val norm = normalize(name)
+                  if (norm.isEmpty()) return false
+                  for (token in tokens) {
+                      if (norm == token || norm.contains(token)) return true
+                  }
+                  return false
+              }
+
+              fun addListener(listener: () -> Unit) {
+                  if (!listeners.contains(listener)) {
+                      listeners.add(listener)
+                  }
+              }
+          }
+          '''.replace("__DEFAULT_BLOCKED__", blocked_default)
+
+          with open(core_path, "w", encoding="utf-8") as f:
+              f.write(core_code)
+          print(f"[*] Created {core_path}")
+
+          # =========================================================================
+          # 3. Inject ArtistBlockHelper.kt into :app (Compose UI + Player Pruner)
+          # =========================================================================
           app_src = "app/src/main/kotlin/com/metrolist/music"
           if not os.path.isdir(app_src):
               app_src = "app/src/main/java/com/metrolist/music"
@@ -91,78 +295,647 @@ jobs:
           helper_path = os.path.join(app_src, "utils", "ArtistBlockHelper.kt")
           os.makedirs(os.path.dirname(helper_path), exist_ok=True)
           with open(helper_path, "w", encoding="utf-8") as f:
-              f.write(f'''package com.metrolist.music.utils
+              f.write('''package com.metrolist.music.utils
 
-          import java.text.Normalizer
-          import java.util.Locale
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.Toast
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ExperimentalLayoutApi
+          import androidx.compose.foundation.layout.FlowRow
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.heightIn
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.FilledTonalButton
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.Player
+          import com.metrolist.innertube.models.ArtistBlockCore
+          import com.metrolist.music.extensions.metadata
+          import com.metrolist.music.models.MediaMetadata
+          import java.lang.ref.WeakReference
 
-          object ArtistBlockHelper {{
-              private val diacriticsRegex = Regex("\\\\p{{Mn}}+")
+          object ArtistBlockHelper {
+              private val mainHandler = Handler(Looper.getMainLooper())
+              val versionState = mutableIntStateOf(0)
 
               @Volatile
-              var rawBlockedArtists: String = "{blocked_default}"
-                  set(value) {{
-                      field = value
-                      normalizedTokens = parseTokens(value)
-                  }}
+              private var playerRef: WeakReference<Player>? = null
 
-              @Volatile
-              var normalizedTokens: List<String> = parseTokens(rawBlockedArtists)
-                  private set
+              init {
+                  ArtistBlockCore.addListener {
+                      mainHandler.post {
+                          versionState.intValue += 1
+                          pruneActivePlayer()
+                      }
+                  }
+              }
 
-              fun normalize(text: String): String {{
-                  val nfd = Normalizer.normalize(text.trim(), Normalizer.Form.NFD)
-                  return diacriticsRegex.replace(nfd, "").lowercase(Locale.ROOT)
-              }}
+              fun initContext(context: Context?) {
+                  if (context != null) {
+                      ArtistBlockCore.attachStorageDir(context.applicationContext.filesDir)
+                  }
+              }
 
-              private fun parseTokens(raw: String): List<String> =
-                  raw.split(',', ';', '\\n').map {{ normalize(it) }}.filter {{ it.isNotEmpty() }}.distinct()
+              fun isArtistNameBlocked(name: CharSequence?): Boolean =
+                  ArtistBlockCore.isArtistNameBlocked(name)
 
-              fun isArtistNameBlocked(name: String?): Boolean {{
-                  if (name.isNullOrBlank()) return false
-                  val norm = normalize(name)
-                  return normalizedTokens.any {{ norm.contains(it) }}
-              }}
-          }}
+              fun isMediaMetadataBlocked(meta: MediaMetadata?): Boolean {
+                  if (meta == null) return false
+                  if (isArtistNameBlocked(meta.title)) return true
+                  if (isArtistNameBlocked(meta.album?.title)) return true
+                  return meta.artists.any { isArtistNameBlocked(it.name) }
+              }
+
+              fun isMediaItemBlocked(item: MediaItem?): Boolean {
+                  if (item == null) return false
+                  if (isMediaMetadataBlocked(item.metadata)) return true
+                  val m = item.mediaMetadata
+                  if (isArtistNameBlocked(m.artist) || isArtistNameBlocked(m.albumArtist) ||
+                      isArtistNameBlocked(m.subtitle) || isArtistNameBlocked(m.title)
+                  ) {
+                      return true
+                  }
+                  return false
+              }
+
+              fun onPlayerActivity(player: Player, transitioningItem: MediaItem?): Boolean {
+                  playerRef = WeakReference(player)
+                  prunePlayerQueue(player)
+                  val checkItem = transitioningItem ?: player.currentMediaItem
+                  if (isMediaItemBlocked(checkItem)) {
+                      val currentIdx = player.currentMediaItemIndex
+                      if (player.hasNextMediaItem()) {
+                          player.seekToNextMediaItem()
+                          if (currentIdx >= 0 && currentIdx < player.mediaItemCount) {
+                              runCatching { player.removeMediaItem(currentIdx) }
+                          }
+                      } else if (currentIdx >= 0 && currentIdx < player.mediaItemCount) {
+                          runCatching { player.removeMediaItem(currentIdx) }
+                          player.stop()
+                      }
+                      return true
+                  }
+                  return false
+              }
+
+              fun pruneActivePlayer() {
+                  val p = playerRef?.get() ?: return
+                  if (Looper.myLooper() == Looper.getMainLooper()) {
+                      prunePlayerQueue(p)
+                      if (isMediaItemBlocked(p.currentMediaItem)) {
+                          val idx = p.currentMediaItemIndex
+                          if (p.hasNextMediaItem()) {p.seekToNextMediaItem()
+                              if (idx >= 0 && idx < p.mediaItemCount) {
+                                  runCatching { p.removeMediaItem(idx) }
+                              }
+                          } else if (idx >= 0 && idx < p.mediaItemCount) {
+                              runCatching { p.removeMediaItem(idx) }
+                              p.stop()
+                          }
+                      }
+                  } else {
+                      mainHandler.post { pruneActivePlayer() }
+                  }
+              }
+
+              private fun prunePlayerQueue(player: Player) {
+                  runCatching {
+                      val count = player.mediaItemCount
+                      val currentIdx = player.currentMediaItemIndex
+                      for (i in count - 1 downTo 0) {
+                          if (i != currentIdx) {
+                              val item = player.getMediaItemAt(i)
+                              if (isMediaItemBlocked(item)) {
+                                  player.removeMediaItem(i)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          fun ArtistBlockMenuBar(
+              artistNames: List<String>,
+              onDismiss: () -> Unit,
+          ) {
+              val context = LocalContext.current
+              LaunchedEffect(Unit) {
+                  ArtistBlockHelper.initContext(context)
+              }
+              val _ver = ArtistBlockHelper.versionState.intValue
+              val distinctArtists = remember(artistNames, _ver) {
+                  artistNames.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+              }
+              if (distinctArtists.isEmpty()) return
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 16.dp, vertical = 8.dp),
+              ) {
+                  FlowRow(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      verticalArrangement = Arrangement.spacedBy(6.dp),
+                  ) {
+                      distinctArtists.forEach { artistName ->
+                          val blocked = ArtistBlockHelper.isArtistNameBlocked(artistName)
+                          if (blocked) {
+                              OutlinedButton(
+                                  onClick = {
+                                      ArtistBlockCore.toggleArtist(artistName)
+                                      Toast.makeText(
+                                          context,
+                                          "Unblocked $artistName",
+                                          Toast.LENGTH_SHORT,
+                                      ).show()
+                                      onDismiss()
+                                  },
+                              ) {
+                                  Text(
+                                      text = "Unblock $artistName",
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis,
+                                  )
+                              }
+                          } else {
+                              FilledTonalButton(
+                                  onClick = {
+                                      ArtistBlockCore.toggleArtist(artistName)
+                                      ArtistBlockHelper.pruneActivePlayer()
+                                      Toast.makeText(
+                                          context,
+                                          "Blocked $artistName (won't play or show in search)",
+                                          Toast.LENGTH_SHORT,
+                                      ).show()
+                                      onDismiss()
+                                  },
+                              ) {
+                                  Text(
+                                      text = "Block $artistName",
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis,
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+              HorizontalDivider()
+          }
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          fun ArtistBlockSettingsCard() {
+              val context = LocalContext.current
+              LaunchedEffect(Unit) {
+                  ArtistBlockHelper.initContext(context)
+              }
+              val _ver = ArtistBlockHelper.versionState.intValue
+              val blockedList = remember(_ver) { ArtistBlockCore.displayArtists }
+              var showDialog by remember { mutableStateOf(false) }
+
+              Surface(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 16.dp, vertical = 8.dp)
+                      .clickable { showDialog = true },
+                  shape = RoundedCornerShape(16.dp),
+                  color = MaterialTheme.colorScheme.surfaceContainerHigh,
+              ) {
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(16.dp),
+                  ) {
+                      Text(
+                          text = "Blocked artists (${blockedList.size})",
+                          style = MaterialTheme.typography.titleMedium,
+                          fontWeight = FontWeight.SemiBold,
+                      )
+                      Spacer(modifier = Modifier.height(4.dp))
+                      Text(
+                          text = if (blockedList.isEmpty()) {
+                              "Tap to block artists from playing or showing in search"
+                          } else {
+                              blockedList.joinToString(", ")
+                          },
+                          style = MaterialTheme.typography.bodyMedium,
+                          color =  MaterialTheme.colorScheme.onSurfaceVariant,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis,
+                      )
+                  }
+              }
+
+              if (showDialog) {
+                  var newArtistInput by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { showDialog = false },
+                      title = { Text("Blocked Artists") },
+                      text = {
+                          Column(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .verticalScroll(rememberScrollState()),
+                          ) {
+                              Text(
+                                  text = "Blocked artists will not play in queues/radio and will be hidden from search results.",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                              Spacer(modifier = Modifier.height(12.dp))
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  verticalAlignment = Alignment.CenterVertically,
+                              ) {
+                                  OutlinedTextField(
+                                      value = newArtistInput,
+                                      onValueChange = { newArtistInput = it },
+                                      modifier = Modifier.weight(1f),
+                                      label = { Text("Artist name (e.g. Beyonce)") },
+                                      singleLine = true,
+                                  )
+                                  Spacer(modifier = Modifier.width(8.dp))
+                                  Button(
+                                      onClick = {
+                                          val trimmed = newArtistInput.trim()
+                                          if (trimmed.isNotEmpty()) {
+                                              trimmed.split(',', ';').forEach { part ->
+                                                  if (part.trim().isNotEmpty()) {
+                                                      ArtistBlockCore.blockArtist(part.trim())
+                                                  }
+                                              }
+                                              ArtistBlockHelper.pruneActivePlayer()
+                                              newArtistInput = ""
+                                          }
+                                      },
+                                  ) {
+                                      Text("Add")
+                                  }
+                              }
+                              Spacer(modifier = Modifier.height(12.dp))
+                              if (blockedList.isEmpty()) {
+                                  Text(
+                                      text = "No artists currently blocked.",
+                                      style = MaterialTheme.typography.bodyMedium,
+                                  )
+                              } else {
+                                  FlowRow(
+                                      modifier = Modifier
+                                          .fillMaxWidth()
+                                          .heightIn(max = 260.dp),
+                                      horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                      verticalArrangement = Arrangement.spacedBy(8.dp),
+                                  ) {
+                                      blockedList.forEach { artist ->
+                                          OutlinedButton(
+                                              onClick = {
+                                                  ArtistBlockCore.unblockArtist(artist)
+                                              },
+                                          ) {
+                                              Text("$artist  ✕")
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(
+                              onClick = {
+                                  val trimmed = newArtistInput.trim()
+                                  if (trimmed.isNotEmpty()) {
+                                      trimmed.split(',', ';').forEach { part ->
+                                          if (part.trim().isNotEmpty()) {
+                                              ArtistBlockCore.blockArtist(part.trim())
+                                          }
+                                      }
+                                      ArtistBlockHelper.pruneActivePlayer()
+                                      newArtistInput = ""
+                                  }
+                                  showDialog = false
+                              },
+                          ) {
+                              Text("Done")
+                          }
+                      },
+                  )
+              }
+          }
           ''')
+          print(f"[*] Created {helper_path}")
 
-          # 3. Patch Queue.kt
-          for root_dir, _, files in os.walk("."):
+          # =========================================================================
+          # 4. Safe parenthesized wrapper matching both braced & unbraced if/else
+          # =========================================================================
+          nested_braces = r"\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}[^{}]*)*\}"
+          block_if_else_pat = (
+              r"(if\s*\([^)]*\)\s*"
+              r"(?:" + nested_braces + r"|[a-zA-Z0-9_.]+\s*" + nested_braces + r")"
+              r"\s*else\s*(?:\{\s*this\s*\}|this\b))"
+          )
+
+          ytitem_patched = False
+          nextpage_patched = False
+          search_patched = False
+          queue_patched = False
+          song_patched = False
+          service_patched = False
+          settings_patched = False
+          menus_patched = []
+
+          # =========================================================================
+          # 5. Patch :innertube YTItem.kt & Page Parsers (Search, Home, Radio, NextPage)
+          # =========================================================================
+          for root_dir, dirs, files in os.walk("innertube"):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d != "build"]
               for fn in files:
-                  if fn == "Queue.kt" and "playback" in root_dir:
-                      p = os.path.join(root_dir, fn)
+                  p = os.path.join(root_dir, fn)
+                  if fn == "YTItem.kt":
                       txt = open(p, encoding="utf-8").read()
+                      if "isBlockedArtistItem" not in txt:
+                          helper_ext = '''
+          fun YTItem.isBlockedArtistItem(): Boolean {
+              if (ArtistBlockCore.isArtistNameBlocked(title)) return true
+              return when (this) {
+                  is SongItem -> artists.any { ArtistBlockCore.isArtistNameBlocked(it.name) } || ArtistBlockCore.isArtistNameBlocked(album?.name)
+                  is AlbumItem -> artists?.any { ArtistBlockCore.isArtistNameBlocked(it.name) } == true
+                  is ArtistItem -> ArtistBlockCore.isArtistNameBlocked(title)
+                  is PlaylistItem -> ArtistBlockCore.isArtistNameBlocked(author?.name)
+                  else -> false
+              }
+          }
+          '''
+                          txt, n1 = re.subn(
+                              r"(fun\s+(?:<T\s*:\s*YTItem>\s*)?List<(?:T|YTItem)>\.filterExplicit\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                              r"\1(\2).filterNot { it.isBlockedArtistItem() }",
+                              txt,
+                              flags=re.DOTALL,
+                          )
+                          txt, n2 = re.subn(
+                              r"(fun\s+(?:<T\s*:\s*YTItem>\s*)?List<(?:T|YTItem)>\.filterVideoSongs\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                              r"\1(\2).filterNot { it.isBlockedArtistItem() }",
+                              txt,
+                              flags=re.DOTALL,
+                          )
+                          if n1 > 0:
+                              txt = txt + "\n" + helper_ext
+                              open(p, "w", encoding="utf-8").write(txt)
+                              ytitem_patched = True
+                              print(f"[*] Patched {p} (filterExplicit={n1}, filterVideoSongs={n2})")
+
+                  elif fn == "NextPage.kt":
+                      txt = open(p, encoding="utf-8").read()
+                      if "ArtistBlockCore" not in txt:
+                          txt, n_sub = re.subn(
+                              r"(fun\s+fromPlaylistPanelVideoRenderer\s*\([^)]*\)\s*:\s*SongItem\?\s*\{)",
+                              r"\1\n        if (renderer.longBylineText?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true || renderer.title?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true) return null",
+                              txt,
+                              flags=re.DOTALL,
+                          )
+                          if n_sub > 0:
+                              open(p, "w", encoding="utf-8").write(txt)
+                              nextpage_patched = True
+                              print(f"[*] Patched {p}")
+
+                  elif fn in ("SearchPage.kt", "SearchSuggestionPage.kt", "SearchSummaryPage.kt", "RelatedPage.kt", "ArtistPage.kt", "ArtistItemsPage.kt"):
+                      txt = open(p, encoding="utf-8").read()
+                      if "ArtistBlockCore" not in txt:
+                          txt, n1 = re.subn(
+                              r"(fun\s+(?:toYTItem|fromMusicResponsiveListItemRenderer)\s*\(\s*renderer\s*:\s*MusicResponsiveListItemRenderer[^)]*\)\s*:\s*(?:YTItem|SongItem)\?\s*\{)",
+                              r"\1\n        if (renderer.flexColumns.any { col -> col.musicResponsiveListItemFlexColumnRenderer.text?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true }) return null",
+                              txt,
+                              flags=re.DOTALL,
+                          )
+                          txt, n2 = re.subn(
+                              r"(fun\s+fromMusicCardShelfRenderer\s*\(\s*renderer\s*:\s*MusicCardShelfRenderer[^)]*\)\s*:\s*YTItem\?\s*\{)",
+                              r"\1\n        if (renderer.title.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true || renderer.subtitle?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true) return null",
+                              txt,
+                              flags=re.DOTALL,
+                          )
+                          if n1 + n2 > 0:
+                              open(p, "w", encoding="utf-8").write(txt)
+                              if fn == "SearchPage.kt":
+                                  search_patched = True
+                              print(f"[*] Patched {p}")
+
+          # =========================================================================
+          # 6. Patch :app Queue.kt, Song/Album filterExplicit, Menus & Settings
+          # =========================================================================
+          for root_dir, dirs, files in os.walk("app"):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d != "build"]
+              for fn in files:
+                  if not fn.endswith(".kt") or fn == "ArtistBlockHelper.kt":
+                      continue
+                  p = os.path.join(root_dir, fn)
+                  txt = open(p, encoding="utf-8").read()
+                  orig_txt = txt
+
+                  # 6a. Patch Queue.kt
+                  if fn == "Queue.kt" and "playback" in root_dir:
                       if "ArtistBlockHelper" not in txt:
                           txt = re.sub(
                               r"(package\s+[^\n]+\n)",
                               r"\1import com.metrolist.music.utils.ArtistBlockHelper\n",
                               txt,
-                              count=1
+                              count=1,
                           )
+                      txt, q1 = re.subn(
+                          r"(fun\s+filterExplicit\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filterItems { !ArtistBlockHelper.isMediaItemBlocked(it) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      txt, q2 = re.subn(
+                          r"(fun\s+filterVideoSongs\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filterItems { !ArtistBlockHelper.isMediaItemBlocked(it) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      txt, q3 = re.subn(
+                          r"(fun\s+List<MediaItem>\.filterExplicit\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filterNot { ArtistBlockHelper.isMediaItemBlocked(it) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      txt, q4 = re.subn(
+                          r"(fun\s+List<MediaItem>\.filterVideoSongs\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filterNot { ArtistBlockHelper.isMediaItemBlocked(it) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      if q1 > 0 and q3 > 0:
+                          queue_patched = True
+
+                  # 6b. Patch List<Song>.filterExplicit / filterVideoSongs / List<Album>.filterExplicitAlbums
+                  if "List<Song>.filterExplicit" in txt or "List<Album>.filterExplicitAlbums" in txt:
+                      if "ArtistBlockHelper" not in txt:
                           txt = re.sub(
-                              r"fun filterExplicit\(enabled: Boolean = true\)\s*=\s*if \(enabled\)\s*\{\s*filterItems\s*\{\s*it\.metadata\?\.explicit != true\s*\}\s*\}\s*else\s*\{\s*this\s*\}",
-                              "fun filterExplicit(enabled: Boolean = true) = filterItems { item ->\n"
-                              "        val meta = item.metadata\n"
-                              "        val blocked = meta != null && (meta.artists.any { ArtistBlockHelper.isArtistNameBlocked(it.name) } || ArtistBlockHelper.isArtistNameBlocked(meta.title))\n"
-                              "        !blocked && (!enabled || meta?.explicit != true)\n"
-                              "    }",
+                              r"(package\s+[^\n]+\n)",
+                              r"\1import com.metrolist.music.utils.ArtistBlockHelper\n",
                               txt,
+                              count=1,
                           )
+                      txt, s1 = re.subn(
+                          r"(fun\s+List<Song>\.filterExplicit\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filter { s -> s.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(s.song.title) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      txt, s2 = re.subn(
+                          r"(fun\s+List<Song>\.filterVideoSongs\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filter { s -> s.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(s.song.title) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      txt, s3 = re.subn(
+                          r"(fun\s+List<Album>\.filterExplicitAlbums\s*\([^)]*\)\s*(?::\s*[^\n=]+)?=\s*)" + block_if_else_pat,
+                          r"\1(\2).filter { a -> a.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(a.album.title) }",
+                          txt,
+                          flags=re.DOTALL,
+                      )
+                      if s1 + s2 + s3 > 0:
+                          song_patched = True
+
+                  # 6c. Patch MusicService.kt onMediaItemTransition to auto-skip & prune blocked tracks
+                  if fn == "MusicService.kt":
+                      if "ArtistBlockHelper" not in txt:
                           txt = re.sub(
-                              r"fun List<MediaItem>\.filterExplicit\(enabled: Boolean = true\)\s*=\s*if \(enabled\)\s*\{\s*filterNot\s*\{\s*it\.metadata\?\.explicit == true\s*\}\s*\}\s*else\s*\{\s*this\s*\}",
-                              "fun List<MediaItem>.filterExplicit(enabled: Boolean = true) = filterNot { item ->\n"
-                              "    val meta = item.metadata\n"
-                              "    val blocked = meta != null && (meta.artists.any { ArtistBlockHelper.isArtistNameBlocked(it.name) } || ArtistBlockHelper.isArtistNameBlocked(meta.title))\n"
-                              "    blocked || (enabled && meta?.explicit == true)\n"
-                              "}",
+                              r"(package\s+[^\n]+\n)",
+                              r"\1import com.metrolist.music.utils.ArtistBlockHelper\n",
                               txt,
+                              count=1,
                           )
-                          open(p, "w", encoding="utf-8").write(txt)
+                      txt, m_sub = re.subn(
+                          r"(override\s+fun\s+onMediaItemTransition\s*\(\s*(\w+)\s*:\s*MediaItem\?\s*,\s*\w+\s*:\s*Int\s*\)\s*\{)",
+                          r"\1\n        ArtistBlockHelper.initContext(this)\n        if (ArtistBlockHelper.onPlayerActivity(player, \2)) return",
+                          txt,
+                          count=1,
+                          flags=re.DOTALL,
+                      )
+                      if m_sub > 0:
+                          service_patched = True
+
+                  # 6d. Patch ContentSettings.kt to add In-App "Blocked artists" Settings Card + Dialog
+                  if fn == "ContentSettings.kt":
+                      if "ArtistBlockSettingsCard" not in txt:
+                          txt = re.sub(
+                              r"(package\s+[^\n]+\n)",
+                              r"\1import com.metrolist.music.utils.ArtistBlockSettingsCard\n",
+                              txt,
+                              count=1,
+                          )
+                          txt, n_sub = re.subn(
+                              r"(Material3SettingsGroup\s*\(|PreferenceGroupTitle\s*\(|SwitchPreference\s*\()",
+                              r"ArtistBlockSettingsCard()\n        \1",
+                              txt,
+                              count=1,
+                          )
+                          if n_sub > 0:
+                              settings_patched = True
+                              print(f"[*] Injected ArtistBlockSettingsCard into {p}")
+
+                  # 6e. Patch 3-Dot Menus: ArtistMenu.kt, YouTubeArtistMenu.kt, SongMenu.kt, YouTubeSongMenu.kt, PlayerMenu.ktif fn in ("ArtistMenu.kt", "YouTubeArtistMenu.kt", "SongMenu.kt", "YouTubeSongMenu.kt", "PlayerMenu.kt"):
+                      if "ArtistBlockMenuBar" not in txt:
+                          txt = re.sub(
+                              r"(package\s+[^\n]+\n)",
+                              r"\1import com.metrolist.music.utils.ArtistBlockMenuBar\n",
+                              txt,
+                              count=1,
+                          )
+                          expr = None
+                          if fn == "ArtistMenu.kt":
+                              m = re.search(r"fun\s+ArtistMenu\s*\([^)]*?(\w+)\s*:\s*Artist\b", txt, re.DOTALL)
+                              if m:
+                                  expr = f"listOf({m.group(1)}.artist.name)"
+                          elif fn == "YouTubeArtistMenu.kt":
+                              m = re.search(r"fun\s+YouTubeArtistMenu\s*\([^)]*?(\w+)\s*:\s*ArtistItem\b", txt, re.DOTALL)
+                              if m:
+                                  expr = f"listOf({m.group(1)}.title)"
+                          elif fn == "SongMenu.kt":
+                              m = re.search(r"fun\s+SongMenu\s*\([^)]*?(\w+)\s*:\s*Song\b", txt, re.DOTALL)
+                              if m:
+                                  expr = f"{m.group(1)}.artists.map {{ it.name }}"
+                          elif fn == "YouTubeSongMenu.kt":
+                              m = re.search(r"fun\s+YouTubeSongMenu\s*\([^)]*?(\w+)\s*:\s*SongItem\b", txt, re.DOTALL)
+                              if m:
+                                  expr = f"{m.group(1)}.artists.map {{ it.name }}"
+                          elif fn == "PlayerMenu.kt":
+                              m = re.search(r"fun\s+PlayerMenu\s*\([^)]*?(\w+)\s*:\s*MediaMetadata\?", txt, re.DOTALL)
+                              if m:
+                                  expr = f"{m.group(1)}?.artists?.map {{ it.name }}.orEmpty()"
+
+                          if expr:
+                              txt, n_sub = re.subn(
+                                  r"HorizontalDivider\s*\(",
+                                  f"ArtistBlockMenuBar(artistNames = {expr}, onDismiss = onDismiss)\n    HorizontalDivider(",
+                                  txt,
+                                  count=1,
+                              )
+                              if n_sub > 0:
+                                  menus_patched.append(fn)
+                                  print(f"[*] Injected ArtistBlockMenuBar into {p}")
+
+                  if txt != orig_txt:
+                      open(p, "w", encoding="utf-8").write(txt)
+                      print(f"[*] Patched {p}")
+
+          # =========================================================================
+          # 7. Strict Fail-Fast Verification Checks
+          # =========================================================================
+          print(f"[*] Patch Summary: YTItem={ytitem_patched}, NextPage={nextpage_patched}, SearchPage={search_patched}, Queue={queue_patched}, Song={song_patched}, MusicService={service_patched}, ContentSettings={settings_patched}, Menus={menus_patched}")
+          if not ytitem_patched:
+              raise SystemExit("FAIL-FAST ERROR: YTItem.kt was not patched!")
+          if not queue_patched:
+              raise SystemExit("FAIL-FAST ERROR: Queue.kt was not patched!")
+          if not service_patched:
+              raise SystemExit("FAIL-FAST ERROR: MusicService.kt was not patched!")
+          if not settings_patched:
+              raise SystemExit("FAIL-FAST ERROR: ContentSettings.kt was not patched!")
+          if not menus_patched:
+              raise SystemExit("FAIL-FAST ERROR: No menu files were patched!")
           EOF
 
           chmod +x gradlew
           ./gradlew assembleDebug -x lint
-          APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+          APK_FOUND=$(find app/build/outputs/apk -name "*fossDebug*.apk" | head -n 1)
+          if [ -z "$APK_FOUND" ]; then APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1); fi
+          if [ -z "$APK_FOUND" ]; then echo "No APK found under app/build/outputs/apk"; exit 1; fi
           cp "$APK_FOUND" Metrolist-ArtistBlock.apk
 
       - name: Upload Patched APK Artifact
