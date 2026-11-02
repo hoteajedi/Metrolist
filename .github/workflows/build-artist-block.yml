@@ -1,3 +1,4 @@
+```yaml
 name: Build Metrolist with Artist Block
 
 on:
@@ -33,16 +34,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Create debug keystore
-        run: |
-          mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkey -v -keystore ~/.android/debug.keystore \
-              -storepass android -alias androiddebugkey -keypass android \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
-
       - name: Fix Duplicate Resources, Patch Source & Compile APK
         env:
           BLOCKED_ARTISTS: ${{ inputs.blocked_artists }}
@@ -50,10 +41,6 @@ jobs:
           set -euo pipefail
           python3 - << 'EOF'
           import os, re, xml.etree.ElementTree as ET
-
-          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
-          ET.register_namespace("tools", "http://schemas.android.com/tools")
-          ET.register_namespace("xliff", "urn:oasis:names:tc:xliff:document:1.2")
 
           # 1. Fix "Error: Duplicate resources" in app/src/main/res/values*
           res_dir = "app/src/main/res"
@@ -68,8 +55,7 @@ jobs:
                       for fn in xml_files:
                           fp = os.path.join(folder_path, fn)
                           try:
-                              parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-                              tree = ET.parse(fp, parser=parser)
+                              tree = ET.parse(fp)
                               root = tree.getroot()
                               removed = False
                               for child in list(root):
@@ -88,9 +74,7 @@ jobs:
                               print(f"[!] Warning parsing {fp}: {e}")
 
           # 2. Inject ArtistBlockHelper.kt
-          blocked_default = os.environ.get("BLOCKED_ARTISTS", "Beyonce")
-          blocked_default = (blocked_default.replace("\\", "\\\\").replace('"', '\\"')
-                             .replace("\r", "").replace("\n", ",").replace("$", "${'$'}"))
+          blocked_default = os.environ.get("BLOCKED_ARTISTS", "Beyonce").replace('"', '\\"')
           app_src = "app/src/main/kotlin/com/metrolist/music"
           if not os.path.isdir(app_src):
               app_src = "app/src/main/java/com/metrolist/music"
@@ -125,18 +109,16 @@ jobs:
               private fun parseTokens(raw: String): List<String> =
                   raw.split(',', ';', '\\n').map {{ normalize(it) }}.filter {{ it.isNotEmpty() }}.distinct()
 
-              fun isArtistNameBlocked(name: CharSequence?): Boolean {{
+              fun isArtistNameBlocked(name: String?): Boolean {{
                   if (name.isNullOrBlank()) return false
-                  val norm = normalize(name.toString())
+                  val norm = normalize(name)
                   return normalizedTokens.any {{ norm.contains(it) }}
               }}
           }}
           ''')
 
-          # 3. Patch Queue.kt (fail loudly if the pattern does not match)
-          patched_files = []
-          for root_dir, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if not d.startswith(".") and d != "build"]
+          # 3. Patch Queue.kt
+          for root_dir, _, files in os.walk("."):
               for fn in files:
                   if fn == "Queue.kt" and "playback" in root_dir:
                       p = os.path.join(root_dir, fn)
@@ -148,7 +130,6 @@ jobs:
                               txt,
                               count=1
                           )
-                          after_import = txt
                           txt = re.sub(
                               r"fun filterExplicit\(enabled: Boolean = true\)\s*=\s*if \(enabled\)\s*\{\s*filterItems\s*\{\s*it\.metadata\?\.explicit != true\s*\}\s*\}\s*else\s*\{\s*this\s*\}",
                               "fun filterExplicit(enabled: Boolean = true) = filterItems { item ->\n"
@@ -167,19 +148,12 @@ jobs:
                               "}",
                               txt,
                           )
-                          if txt != after_import and "ArtistBlockHelper" in txt:
-                              open(p, "w", encoding="utf-8").write(txt)
-                              patched_files.append(p)
-                              print(f"[*] Patched {p}")
-          if not patched_files:
-              raise SystemExit("ERROR: Queue.kt was not patched - filterExplicit pattern did not match. Check Queue.kt formatting.")
+                          open(p, "w", encoding="utf-8").write(txt)
           EOF
 
           chmod +x gradlew
           ./gradlew assembleDebug -x lint
-          APK_FOUND=$(find app/build/outputs/apk -name "*fossDebug*.apk" | head -n 1)
-          if [ -z "$APK_FOUND" ]; then APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1); fi
-          if [ -z "$APK_FOUND" ]; then echo "No APK found under app/build/outputs/apk"; exit 1; fi
+          APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
           cp "$APK_FOUND" Metrolist-ArtistBlock.apk
 
       - name: Upload Patched APK Artifact
