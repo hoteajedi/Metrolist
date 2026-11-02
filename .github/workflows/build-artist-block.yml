@@ -1,0 +1,178 @@
+name: Build Metrolist with Artist Block
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocked_artists:
+        description: "Default blocked artists (comma-separated, e.g. Beyonce, Drake)"
+        required: true
+        default: "Beyonce"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-artist-block:
+    name: Build Metrolist Artist-Block APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout forked repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fix Duplicate Resources, Patch Source & Compile APK
+        env:
+          BLOCKED_ARTISTS: ${{ inputs.blocked_artists }}
+        run: |
+          set -euo pipefail
+          python3 - << 'EOF'
+          import os, re, xml.etree.ElementTree as ET
+
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          ET.register_namespace("xliff", "urn:oasis:names:tc:xliff:document:1.2")
+
+          # 1. Fix "Error: Duplicate resources" in app/src/main/res/values*
+          res_dir = "app/src/main/res"
+          if os.path.isdir(res_dir):
+              for folder in os.listdir(res_dir):
+                  folder_path = os.path.join(res_dir, folder)
+                  if os.path.isdir(folder_path) and folder.startswith("values"):
+                      seen_items = set()
+                      # Process strings.xml first, then metrolist_strings.xml and others
+                      xml_files = sorted([f for f in os.listdir(folder_path) if f.endswith(".xml")],
+                                         key=lambda x: (0 if x == "strings.xml" else 1, x))
+                      for fn in xml_files:
+                          fp = os.path.join(folder_path, fn)
+                          try:
+                              parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+                              tree = ET.parse(fp, parser=parser)
+                              root = tree.getroot()
+                              removed = False
+                              for child in list(root):
+                                  name = child.attrib.get("name")
+                                  if name:
+                                      key = (child.tag, name)
+                                      if key in seen_items:
+                                          root.remove(child)
+                                          removed = True
+                                          print(f"[*] Removed duplicate {child.tag} '{name}' from {fp}")
+                                      else:
+                                          seen_items.add(key)
+                              if removed:
+                                  tree.write(fp, encoding="utf-8", xml_declaration=True)
+                          except Exception as e:
+                              print(f"[!] Warning parsing {fp}: {e}")
+
+          # 2. Inject ArtistBlockHelper.kt
+          blocked_default = os.environ.get("BLOCKED_ARTISTS", "Beyonce")
+          blocked_default = (blocked_default.replace("\\", "\\\\").replace('"', '\\"')
+                             .replace("\r", "").replace("\n", ",").replace("$", "${'$'}"))
+          app_src = "app/src/main/kotlin/com/metrolist/music"
+          if not os.path.isdir(app_src):
+              app_src = "app/src/main/java/com/metrolist/music"
+
+          helper_path = os.path.join(app_src, "utils", "ArtistBlockHelper.kt")
+          os.makedirs(os.path.dirname(helper_path), exist_ok=True)
+          with open(helper_path, "w", encoding="utf-8") as f:
+              f.write(f'''package com.metrolist.music.utils
+
+          import java.text.Normalizer
+          import java.util.Locale
+
+          object ArtistBlockHelper {{
+              private val diacriticsRegex = Regex("\\\\p{{Mn}}+")
+
+              @Volatile
+              var rawBlockedArtists: String = "{blocked_default}"
+                  set(value) {{
+                      field = value
+                      normalizedTokens = parseTokens(value)
+                  }}
+
+              @Volatile
+              var normalizedTokens: List<String> = parseTokens(rawBlockedArtists)
+                  private set
+
+              fun normalize(text: String): String {{
+                  val nfd = Normalizer.normalize(text.trim(), Normalizer.Form.NFD)
+                  return diacriticsRegex.replace(nfd, "").lowercase(Locale.ROOT)
+              }}
+
+              private fun parseTokens(raw: String): List<String> =
+                  raw.split(',', ';', '\\n').map {{ normalize(it) }}.filter {{ it.isNotEmpty() }}.distinct()
+
+              fun isArtistNameBlocked(name: CharSequence?): Boolean {{
+                  if (name.isNullOrBlank()) return false
+                  val norm = normalize(name.toString())
+                  return normalizedTokens.any {{ norm.contains(it) }}
+              }}
+          }}
+          ''')
+
+          # 3. Patch Queue.kt (fail loudly if the pattern does not match)
+          patched_files = []
+          for root_dir, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d != "build"]
+              for fn in files:
+                  if fn == "Queue.kt" and "playback" in root_dir:
+                      p = os.path.join(root_dir, fn)
+                      txt = open(p, encoding="utf-8").read()
+                      if "ArtistBlockHelper" not in txt:
+                          txt = re.sub(
+                              r"(package\s+[^\n]+\n)",
+                              r"\1import com.metrolist.music.utils.ArtistBlockHelper\n",
+                              txt,
+                              count=1
+                          )
+                          after_import = txt
+                          txt = re.sub(
+                              r"fun filterExplicit\(enabled: Boolean = true\)\s*=\s*if \(enabled\)\s*\{\s*filterItems\s*\{\s*it\.metadata\?\.explicit != true\s*\}\s*\}\s*else\s*\{\s*this\s*\}",
+                              "fun filterExplicit(enabled: Boolean = true) = filterItems { item ->\n"
+                              "        val meta = item.metadata\n"
+                              "        val blocked = meta != null && (meta.artists.any { ArtistBlockHelper.isArtistNameBlocked(it.name) } || ArtistBlockHelper.isArtistNameBlocked(meta.title))\n"
+                              "        !blocked && (!enabled || meta?.explicit != true)\n"
+                              "    }",
+                              txt,
+                          )
+                          txt = re.sub(
+                              r"fun List<MediaItem>\.filterExplicit\(enabled: Boolean = true\)\s*=\s*if \(enabled\)\s*\{\s*filterNot\s*\{\s*it\.metadata\?\.explicit == true\s*\}\s*\}\s*else\s*\{\s*this\s*\}",
+                              "fun List<MediaItem>.filterExplicit(enabled: Boolean = true) = filterNot { item ->\n"
+                              "    val meta = item.metadata\n"
+                              "    val blocked = meta != null && (meta.artists.any { ArtistBlockHelper.isArtistNameBlocked(it.name) } || ArtistBlockHelper.isArtistNameBlocked(meta.title))\n"
+                              "    blocked || (enabled && meta?.explicit == true)\n"
+                              "}",
+                              txt,
+                          )
+                          if txt != after_import and "ArtistBlockHelper" in txt:
+                              open(p, "w", encoding="utf-8").write(txt)
+                              patched_files.append(p)
+                              print(f"[*] Patched {p}")
+          if not patched_files:
+              raise SystemExit("ERROR: Queue.kt was not patched - filterExplicit pattern did not match. Check Queue.kt formatting.")
+          EOF
+
+          chmod +x gradlew
+          ./gradlew assembleDebug -x lint
+          APK_FOUND=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          if [ -z "$APK_FOUND" ]; then echo "No APK found in app/build/outputs/apk/debug"; exit 1; fi
+          cp "$APK_FOUND" Metrolist-ArtistBlock.apk
+
+      - name: Upload Patched APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metrolist-ArtistBlock-APK
+          path: Metrolist-ArtistBlock.apk
