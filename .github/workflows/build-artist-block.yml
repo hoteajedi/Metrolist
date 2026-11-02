@@ -177,8 +177,9 @@ jobs:
 
           chmod +x gradlew
           ./gradlew assembleDebug -x lint
-          APK_FOUND=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
-          if [ -z "$APK_FOUND" ]; then echo "No APK found in app/build/outputs/apk/debug"; exit 1; fi
+          APK_FOUND=$(find app/build/outputs/apk -name "*fossDebug*.apk" | head -n 1)
+          if [ -z "$APK_FOUND" ]; then APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1); fi
+          if [ -z "$APK_FOUND" ]; then echo "No APK found under app/build/outputs/apk"; exit 1; fi
           cp "$APK_FOUND" Metrolist-ArtistBlock.apk
 
       - name: Upload Patched APK Artifact
