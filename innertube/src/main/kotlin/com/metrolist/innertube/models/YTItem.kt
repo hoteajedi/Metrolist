@@ -161,18 +161,18 @@ data class EpisodeItem(
 }
 
 fun <T : YTItem> List<T>.filterExplicit(enabled: Boolean = true) =
-    if (enabled) {
+    (if (enabled) {
         filter { !it.explicit }
     } else {
         this
-    }
+    }).filterNot { it.isBlockedArtistItem() }
 
 fun <T : YTItem> List<T>.filterVideoSongs(disableVideos: Boolean = false) =
-    if (disableVideos) {
+    (if (disableVideos) {
         filterNot { it is SongItem && it.isVideoSong }
     } else {
         this
-    }
+    }).filterNot { it.isBlockedArtistItem() }
 
 fun <T : YTItem> List<T>.filterYoutubeShorts(enabled: Boolean = false) =
     if (enabled) {
@@ -180,3 +180,15 @@ fun <T : YTItem> List<T>.filterYoutubeShorts(enabled: Boolean = false) =
     } else {
         this
     }
+
+
+fun YTItem.isBlockedArtistItem(): Boolean {
+    if (ArtistBlockCore.isArtistNameBlocked(title)) return true
+    return when (this) {
+        is SongItem -> artists.any { ArtistBlockCore.isArtistNameBlocked(it.name) } || ArtistBlockCore.isArtistNameBlocked(album?.name)
+        is AlbumItem -> artists?.any { ArtistBlockCore.isArtistNameBlocked(it.name) } == true
+        is ArtistItem -> ArtistBlockCore.isArtistNameBlocked(title)
+        is PlaylistItem -> ArtistBlockCore.isArtistNameBlocked(author?.name)
+        else -> false
+    }
+}

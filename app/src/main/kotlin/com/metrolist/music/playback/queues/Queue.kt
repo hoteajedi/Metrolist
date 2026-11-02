@@ -4,6 +4,7 @@
  */
 
 package com.metrolist.music.playback.queues
+import com.metrolist.music.utils.ArtistBlockHelper
 
 import androidx.media3.common.MediaItem
 import com.metrolist.music.extensions.metadata
@@ -25,10 +26,10 @@ interface Queue {
         val position: Long = 0L,
     ) {
         fun filterExplicit(enabled: Boolean = true) =
-            if (enabled) filterItems { it.metadata?.explicit != true } else this
+            (if (enabled) filterItems { it.metadata?.explicit != true } else this).filterItems { !ArtistBlockHelper.isMediaItemBlocked(it) }
 
         fun filterVideoSongs(disableVideos: Boolean = false) =
-            if (disableVideos) filterItems { it.metadata?.isVideoSong != true } else this
+            (if (disableVideos) filterItems { it.metadata?.isVideoSong != true } else this).filterItems { !ArtistBlockHelper.isMediaItemBlocked(it) }
 
         // Keeps mediaItemIndex on the same song; if that song is removed, starts at the next kept one.
         private fun filterItems(keep: (MediaItem) -> Boolean): Status {
@@ -46,17 +47,17 @@ interface Queue {
 }
 
 fun List<MediaItem>.filterExplicit(enabled: Boolean = true) =
-    if (enabled) {
+    (if (enabled) {
         filterNot {
             it.metadata?.explicit == true
         }
     } else {
         this
-    }
+    }).filterNot { ArtistBlockHelper.isMediaItemBlocked(it) }
 
 fun List<MediaItem>.filterVideoSongs(disableVideos: Boolean = false) =
-    if (disableVideos) {
+    (if (disableVideos) {
         filterNot { it.metadata?.isVideoSong == true }
     } else {
         this
-    }
+    }).filterNot { ArtistBlockHelper.isMediaItemBlocked(it) }

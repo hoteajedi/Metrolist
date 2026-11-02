@@ -20,6 +20,7 @@ data class NextResult(
 
 object NextPage {
     fun fromPlaylistPanelVideoRenderer(renderer: PlaylistPanelVideoRenderer): SongItem? {
+        if (renderer.longBylineText?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true || renderer.title?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true) return null
         val longByLineRuns = renderer.longBylineText?.runs?.splitBySeparator() ?: return null
 
         // Extract library tokens using the new method that properly handles multiple toggle items

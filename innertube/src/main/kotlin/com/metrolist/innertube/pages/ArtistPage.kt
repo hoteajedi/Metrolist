@@ -70,6 +70,7 @@ data class ArtistPage(
         }
 
         private fun fromMusicResponsiveListItemRenderer(renderer: MusicResponsiveListItemRenderer): SongItem? {
+        if (renderer.flexColumns.any { col -> col.musicResponsiveListItemFlexColumnRenderer.text?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true }) return null
             val subtitleLine = renderer.flexColumns
                 .getOrNull(1)
                 ?.musicResponsiveListItemFlexColumnRenderer

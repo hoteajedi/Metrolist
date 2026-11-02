@@ -4,6 +4,7 @@
  */
 
 package com.metrolist.music.ui.menu
+import com.metrolist.music.utils.ArtistBlockMenuBar
 
 import android.content.Intent
 import android.content.res.Configuration
@@ -69,6 +70,7 @@ fun YouTubeArtistMenu(
         trailingContent = {},
     )
 
+    ArtistBlockMenuBar(artistNames = listOf(artist.title), onDismiss = onDismiss)
     HorizontalDivider()
 
     Spacer(modifier = Modifier.height(12.dp))

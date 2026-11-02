@@ -6,6 +6,7 @@
 @file:Suppress("DEPRECATION")
 
 package com.metrolist.music.playback
+import com.metrolist.music.utils.ArtistBlockHelper
 
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
@@ -2532,6 +2533,8 @@ class MusicService :
         mediaItem: MediaItem?,
         reason: Int,
     ) {
+        ArtistBlockHelper.initContext(this)
+        if (ArtistBlockHelper.onPlayerActivity(player, mediaItem)) return
         // Only natural completion transitions mark the previous track as fully cached,
         // never a manual skip or seek. Read lastTransitionedMediaId before replacing it.
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||

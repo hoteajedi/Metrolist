@@ -4,6 +4,7 @@
  */
 
 package com.metrolist.music.ui.menu
+import com.metrolist.music.utils.ArtistBlockMenuBar
 
 import android.content.Context
 import android.content.Intent
@@ -296,6 +297,7 @@ fun PlayerMenu(
 
     Spacer(modifier = Modifier.height(20.dp))
 
+    ArtistBlockMenuBar(artistNames = mediaMetadata?.artists?.map { it.name }.orEmpty(), onDismiss = onDismiss)
     HorizontalDivider()
 
     Spacer(modifier = Modifier.height(12.dp))

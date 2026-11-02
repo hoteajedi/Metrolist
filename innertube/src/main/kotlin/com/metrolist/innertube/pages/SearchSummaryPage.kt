@@ -75,6 +75,7 @@ data class SearchSummaryPage(
 
     companion object {
         fun fromMusicCardShelfRenderer(renderer: MusicCardShelfRenderer): YTItem? {
+        if (renderer.title.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true || renderer.subtitle?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true) return null
             val subtitle = renderer.subtitle.runs?.splitBySeparator()
             return when {
                 renderer.onTap.watchEndpoint != null -> {

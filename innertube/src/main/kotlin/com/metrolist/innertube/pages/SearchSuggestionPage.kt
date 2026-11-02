@@ -14,6 +14,7 @@ import com.metrolist.innertube.utils.parseTime
 
 object SearchSuggestionPage {
     fun fromMusicResponsiveListItemRenderer(renderer: MusicResponsiveListItemRenderer): YTItem? {
+        if (renderer.flexColumns.any { col -> col.musicResponsiveListItemFlexColumnRenderer.text?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true }) return null
         return when {
             renderer.isPodcast -> {
                 val secondaryLine =

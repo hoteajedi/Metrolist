@@ -21,6 +21,7 @@ data class RelatedPage(
 ) {
     companion object {
         fun fromMusicResponsiveListItemRenderer(renderer: MusicResponsiveListItemRenderer): SongItem? {
+        if (renderer.flexColumns.any { col -> col.musicResponsiveListItemFlexColumnRenderer.text?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true }) return null
             // Extract library tokens using the new method that properly handles multiple toggle items
             val libraryTokens = PageHelper.extractLibraryTokensFromMenuItems(renderer.menu?.menuRenderer?.items)
 

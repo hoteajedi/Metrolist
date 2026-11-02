@@ -4,6 +4,7 @@
  */
 
 package com.metrolist.music.ui.screens.settings
+import com.metrolist.music.utils.ArtistBlockSettingsCard
 
 import android.content.Intent
 import android.os.Build
@@ -743,6 +744,7 @@ fun ContentSettings(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp),
     ) {
+        ArtistBlockSettingsCard()
         Material3SettingsGroup(
             title = stringResource(R.string.general),
             items = listOf(

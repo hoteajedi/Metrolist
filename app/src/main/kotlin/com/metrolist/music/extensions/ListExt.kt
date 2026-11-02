@@ -4,6 +4,7 @@
  */
 
 package com.metrolist.music.extensions
+import com.metrolist.music.utils.ArtistBlockHelper
 
 import com.metrolist.music.db.entities.Album
 import com.metrolist.music.db.entities.Playlist
@@ -21,27 +22,27 @@ fun <T> MutableList<T>.move(
 
 // Extension function to filter explicit content for local Song entities
 fun List<Song>.filterExplicit(enabled: Boolean = true) =
-    if (enabled) {
+    (if (enabled) {
         filter { !it.song.explicit }
     } else {
         this
-    }
+    }).filter { s -> s.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(s.song.title) }
 
 // Extension function to filter video songs for local Song entities
 fun List<Song>.filterVideoSongs(enabled: Boolean = true) =
-    if (enabled) {
+    (if (enabled) {
         filter { !it.song.isVideo }
     } else {
         this
-    }
+    }).filter { s -> s.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(s.song.title) }
 
 // Extension function to filter explicit content for local Album entities
 fun List<Album>.filterExplicitAlbums(enabled: Boolean = true) =
-    if (enabled) {
+    (if (enabled) {
         filter { !it.album.explicit }
     } else {
         this
-    }
+    }).filter { a -> a.artists.none { ArtistBlockHelper.isArtistNameBlocked(it.name) } && !ArtistBlockHelper.isArtistNameBlocked(a.album.title) }
 
 // Extension function to filter YouTube Shorts playlist
 fun List<Playlist>.filterYoutubeShorts(enabled: Boolean = false) =

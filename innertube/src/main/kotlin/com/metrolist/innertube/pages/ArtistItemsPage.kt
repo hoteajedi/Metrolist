@@ -16,6 +16,7 @@ data class ArtistItemsPage(
 ) {
     companion object {
         fun fromMusicResponsiveListItemRenderer(renderer: MusicResponsiveListItemRenderer): SongItem? {
+        if (renderer.flexColumns.any { col -> col.musicResponsiveListItemFlexColumnRenderer.text?.runs?.any { com.metrolist.innertube.models.ArtistBlockCore.isArtistNameBlocked(it.text) } == true }) return null
             val artists =
                 PageHelper.extractArtists(
                     renderer.flexColumns
