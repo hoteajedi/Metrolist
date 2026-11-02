@@ -163,6 +163,7 @@ jobs:
                       } else null
                   }.getOrNull()
               }
+
               @Synchronized
               fun attachStorageDir(filesDir: File) {
                   val f = File(filesDir, FILE_NAME)
@@ -416,7 +417,8 @@ jobs:
                       prunePlayerQueue(p)
                       if (isMediaItemBlocked(p.currentMediaItem)) {
                           val idx = p.currentMediaItemIndex
-                          if (p.hasNextMediaItem()) {p.seekToNextMediaItem()
+                          if (p.hasNextMediaItem()) {
+                              p.seekToNextMediaItem()
                               if (idx >= 0 && idx < p.mediaItemCount) {
                                   runCatching { p.removeMediaItem(idx) }
                               }
@@ -555,7 +557,7 @@ jobs:
                               blockedList.joinToString(", ")
                           },
                           style = MaterialTheme.typography.bodyMedium,
-                          color =  MaterialTheme.colorScheme.onSurfaceVariant,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
                           maxLines = 2,
                           overflow = TextOverflow.Ellipsis,
                       )
@@ -870,7 +872,8 @@ jobs:
                               settings_patched = True
                               print(f"[*] Injected ArtistBlockSettingsCard into {p}")
 
-                  # 6e. Patch 3-Dot Menus: ArtistMenu.kt, YouTubeArtistMenu.kt, SongMenu.kt, YouTubeSongMenu.kt, PlayerMenu.ktif fn in ("ArtistMenu.kt", "YouTubeArtistMenu.kt", "SongMenu.kt", "YouTubeSongMenu.kt", "PlayerMenu.kt"):
+                  # 6e. Patch 3-Dot Menus: ArtistMenu.kt, YouTubeArtistMenu.kt, SongMenu.kt, YouTubeSongMenu.kt, PlayerMenu.kt
+                  if fn in ("ArtistMenu.kt", "YouTubeArtistMenu.kt", "SongMenu.kt", "YouTubeSongMenu.kt", "PlayerMenu.kt"):
                       if "ArtistBlockMenuBar" not in txt:
                           txt = re.sub(
                               r"(package\s+[^\n]+\n)",
